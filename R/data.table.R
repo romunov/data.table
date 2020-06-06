@@ -380,204 +380,193 @@ replace_dot_alias = function(e) {
       if (locked.N) lockBinding(".N", parent.frame())
     }
     if (remove.N) rm(list=".N", envir=parent.frame())
-    if (is.matrix(i)) {
-      if (is.numeric(i) && ncol(i)==1L) { # #826 - subset DT on single integer vector stored as matrix
-        i = as.integer(i)
-      } else {
-        stop("i is invalid type (matrix). Perhaps in future a 2 column matrix could return a list of elements of DT (in the spirit of A[B] in FAQ 2.14). Please report to data.table issue tracker if you'd like this, or add your comments to FR #657.")
-      }
-    }
-    if (is.logical(i)) {
-      if (notjoin) {
-        notjoin = FALSE
-        i = !i
-      }
-    }
+
     if (is.null(i)) return( null.data.table() )
-    if (is.character(i)) {
-      isnull_inames = TRUE
-      i = data.table(V1=i)   # for user convenience; e.g. DT["foo"] without needing DT[.("foo")]
-    } else if (identical(class(i),"list") && length(i)==1L && is.data.frame(i[[1L]])) { i = as.data.table(i[[1L]]) }
-    else if (identical(class(i),"data.frame")) { i = as.data.table(i) }   # TO DO: avoid these as.data.table() and use a flag instead
-    else if (identical(class(i),"list")) {
-      isnull_inames = is.null(names(i))
-      i = as.data.table(i)
-    }
-
-    if (is.data.table(i)) {
-      if (missing(on)) {
-        if (!haskey(x)) {
-          stop("When i is a data.table (or character vector), the columns to join by must be specified using 'on=' argument (see ?data.table), by keying x (i.e. sorted, and, marked as sorted, see ?setkey), or by sharing column names between x and i (i.e., a natural join). Keyed joins might have further speed benefits on very large data due to x being sorted in RAM.")
-        }
-      } else if (identical(substitute(on), as.name(".NATURAL"))) {
-        naturaljoin = TRUE
-      }
-      if (naturaljoin) { # natural join #629
-        common_names = intersect(names_x, names(i))
-        len_common_names = length(common_names)
-        if (!len_common_names) stop("Attempting to do natural join but no common columns in provided tables")
-        if (verbose) {
-          which_cols_msg = if (len_common_names == length(x)) " all 'x' columns"
-          else paste(":", brackify(common_names))
-          cat("Joining but 'x' has no key, natural join using", which_cols_msg, "\n", sep = "")
-        }
-        on = common_names
-      }
-      if (!missing(on)) {
-        # on = .() is now possible, #1257
-        on_ops = .parse_on(substitute(on), isnull_inames)
-        on = on_ops[[1L]]
-        ops = on_ops[[2L]]
-        if (any(ops > 1L)) { ## fix for #4489;  ops = c("==", "<=", "<", ">=", ">", "!=")
-          allow.cartesian = TRUE
-        }
-        # TODO: collect all '==' ops first to speeden up Cnestedid
-        rightcols = colnamesInt(x, names(on), check_dups=FALSE)
-        leftcols  = colnamesInt(i, unname(on), check_dups=FALSE)
-      } else {
-        ## missing on
-        rightcols = chmatch(key(x), names_x)   # NAs here (i.e. invalid data.table) checked in bmerge()
-        leftcols = if (haskey(i))
-          chmatch(head(key(i), length(rightcols)), names(i))
-        else
-          seq_len(min(length(i),length(rightcols)))
-        rightcols = head(rightcols,length(leftcols))
-        ops = rep(1L, length(leftcols))
-      }
-      # Implementation for not-join along with by=.EACHI, #604
-      if (notjoin && (byjoin || mult != "all")) { # mult != "all" needed for #1571
-        notjoin = FALSE
-        if (verbose) {last.started.at=proc.time();cat("not-join called with 'by=.EACHI'; Replacing !i with i=setdiff_(x,i) ...");flush.console()}
-        orignames = copy(names(i))
-        i = setdiff_(x, i, rightcols, leftcols) # part of #547
-        if (verbose) {cat("done in",timetaken(last.started.at),"\n"); flush.console()}
-        setnames(i, orignames[leftcols])
-        setattr(i, 'sorted', names(i)) # since 'x' has key set, this'll always be sorted
-      }
-      i = .shallow(i, retain.key = TRUE)
-      ans = bmerge(i, x, leftcols, rightcols, roll, rollends, nomatch, mult, ops, verbose=verbose)
-      xo = ans$xo ## to make it available for further use.
-      # temp fix for issue spotted by Jan, test #1653.1. TODO: avoid this
-      # 'setorder', as there's another 'setorder' in generating 'irows' below...
-      if (length(ans$indices)) setorder(setDT(ans[1L:3L]), indices)
-      allLen1 = ans$allLen1
-      f__ = ans$starts
-      len__ = ans$lens
-      allGrp1 = FALSE # was previously 'ans$allGrp1'. Fixing #1991. TODO: Revisit about allGrp1 possibility for speedups in certain cases when I find some time.
-      indices__ = if (length(ans$indices)) ans$indices else seq_along(f__) # also for #1991 fix
-      # length of input nomatch (single 0 or NA) is 1 in both cases.
-      # When no match, len__ is 0 for nomatch=0 and 1 for nomatch=NA, so len__ isn't .N
-      # If using secondary key of x, f__ will refer to xo
-      if (is.na(which)) {
-        w = if (notjoin) f__!=0L else is.na(f__)
-        return( if (length(xo)) fsort(xo[w], internal=TRUE) else which(w) )
-      }
-      if (mult=="all") {
-        # is by=.EACHI along with non-equi join?
-        nqbyjoin = byjoin && length(ans$indices) && !allGrp1
-        if (!byjoin || nqbyjoin) {
-          # Really, `anyDuplicated` in base is AWESOME!
-          # allow.cartesian shouldn't error if a) not-join, b) 'i' has no duplicates
-          if (verbose) {last.started.at=proc.time();cat("Constructing irows for '!byjoin || nqbyjoin' ... ");flush.console()}
-          irows = if (allLen1) f__ else vecseq(f__,len__,
-            if (allow.cartesian ||
-                notjoin || # #698. When notjoin=TRUE, ignore allow.cartesian. Rows in answer will never be > nrow(x).
-                !anyDuplicated(f__, incomparables = c(0L, NA_integer_))) {
-              NULL # #742. If 'i' has no duplicates, ignore
-            } else as.double(nrow(x)+nrow(i))) # rows in i might not match to x so old max(nrow(x),nrow(i)) wasn't enough. But this limit now only applies when there are duplicates present so the reason now for nrow(x)+nrow(i) is just to nail it down and be bigger than max(nrow(x),nrow(i)).
-          if (verbose) {cat(timetaken(last.started.at),"\n"); flush.console()}
-          # Fix for #1092 and #1074
-          # TODO: implement better version of "any"/"all"/"which" to avoid
-          # unnecessary construction of logical vectors
-          if (identical(nomatch, 0L) && allLen1) irows = irows[irows != 0L]
-        } else {
-          if (length(xo) && missing(on))
-            stop("Internal error. Cannot by=.EACHI when joining to a secondary key, yet") # nocov
-          # since f__ refers to xo later in grouping, so xo needs to be passed through to dogroups too.
-          if (length(irows))
-            stop("Internal error. irows has length in by=.EACHI") # nocov
-        }
-        if (nqbyjoin) {
-          irows = if (length(xo)) xo[irows] else irows
-          xo = setorder(setDT(list(indices=rep.int(indices__, len__), irows=irows)))[["irows"]]
-          ans = .Call(CnqRecreateIndices, xo, len__, indices__, max(indices__), nomatch) # issue#4388 fix
-          f__ = ans[[1L]]; len__ = ans[[2L]]
-          allLen1 = FALSE # TODO; should this always be FALSE?
-          irows = NULL # important to reset
-          if (any_na(as_list(xo))) xo = xo[!is.na(xo)]
-        }
-      } else {
-        if (!byjoin) { #1287 and #1271
-          irows = f__ # len__ is set to 1 as well, no need for 'pmin' logic
-          if (identical(nomatch,0L)) irows = irows[len__>0L]  # 0s are len 0, so this removes -1 irows
-        }
-        # TODO: when nomatch=NA, len__ need not be allocated / set at all for mult="first"/"last"?
-        # TODO: how about when nomatch=0L, can we avoid allocating then as well?
-      }
-      if (length(xo) && length(irows)) {
-        irows = xo[irows]   # TO DO: fsort here?
-        if (mult=="all" && !allGrp1) { # following #1991 fix, !allGrp1 will always be TRUE. TODO: revisit.
-          if (verbose) {last.started.at=proc.time();cat("Reorder irows for 'mult==\"all\" && !allGrp1' ... ");flush.console()}
-          irows = setorder(setDT(list(indices=rep.int(indices__, len__), irows=irows)))[["irows"]]
-          if (verbose) {cat(timetaken(last.started.at),"\n"); flush.console()}
-        }
-      }
-      if (optimizedSubset){
-        ## special treatment for calls like DT[x == 3] that are transformed into DT[J(x=3), on = "x==x"]
-
-        if(!.Call(CisOrderedSubset, irows, nrow(x))){
-          ## restore original order. This is a very expensive operation.
-          ## benchmarks have shown that starting with 1e6 irows, a tweak can significantly reduce time
-          ## (see #2366)
-          if (verbose) {last.started.at=proc.time()[3L];cat("Reordering", length(irows), "rows after bmerge done in ... ");flush.console()}
-          if(length(irows) < 1e6){
-            irows = fsort(irows, internal=TRUE) ## internally, fsort on integer falls back to forderv
-            } else {
-              irows = as.integer(fsort(as.numeric(irows))) ## nocov; parallelized for numeric, but overhead of type conversion
-            }
-          if (verbose) {cat(round(proc.time()[3L]-last.started.at,3L),"secs\n");flush.console()}
-        }
-        ## make sure, all columns are taken from x and not from i.
-        ## This is done by simply telling data.table to continue as if there was a simple subset
-        leftcols  = integer(0L)
-        rightcols = integer(0L)
-        i = irows ## important to make i not a data.table because otherwise Gforce doesn't kick in
-      }
-    }
-    else {
-      if (!missing(on)) {
+    
+    if (is.logical(i)) {
+      if (!missing(on))
         stop("logical error. i is not a data.table, but 'on' argument is provided.")
-      }
-      # TO DO: TODO: Incorporate which_ here on DT[!i] where i is logical. Should avoid i = !i (above) - inefficient.
-      # i is not a data.table
-      if (!is.logical(i) && !is.numeric(i)) stop("i has evaluated to type ", typeof(i), ". Expecting logical, integer or double.")
-      if (is.logical(i)) {
-        if (length(i)==1L  # to avoid unname copy when length(i)==nrow (normal case we don't want to slow down)
-          && isTRUE(unname(i))) { irows=i=NULL }  # unname() for #2152 - length 1 named logical vector.
-        # NULL is efficient signal to avoid creating 1:nrow(x) but still return all rows, fixes #1249
+      if (length(i)==1L  # to avoid unname copy when length(i)==nrow (normal case we don't want to slow down)
+          && !is.na(unname(i))  # unname() for #2152 - length 1 named logical vector.
+          && i != notjoin) { irows=i=NULL } # NULL is efficient signal to avoid creating 1:nrow(x) but still return all rows, fixes #1249
+      else if (length(i)<=1L) { irows=i=integer(0L) }
+      # FALSE, NA and empty. All should return empty data.table. The NA here will be result of expression,
+      # where for consistency of edge case #1252 all NA to be removed. If NA is a single NA symbol, it
+      # was auto converted to NA_integer_ higher up for ease of use and convenience. We definitely
+      # don't want base R behaviour where DF[NA,] returns an entire copy filled with NA everywhere.
+      else if (length(i)==nrow(x)) { irows = i = which_(i, !notjoin)}  
+      # The which() here auto removes NA for convenience so user doesn't need to remember "!is.na() & ..."
+      # Also this which() is for consistency of DT[colA>3,which=TRUE] and which(DT[,colA>3])
+      # Assigning to 'i' here as well to save memory, #926.
+      else stop("i evaluates to a logical vector length ", length(i), " but there are ", nrow(x), " rows. Recycling of logical i is no longer allowed as it hides more bugs than is worth the rare convenience. Explicitly use rep(...,length=.N) if you really need to recycle.")
 
-        else if (length(i)<=1L) { irows=i=integer(0L) }
-        # FALSE, NA and empty. All should return empty data.table. The NA here will be result of expression,
-        # where for consistency of edge case #1252 all NA to be removed. If NA is a single NA symbol, it
-        # was auto converted to NA_integer_ higher up for ease of use and convenience. We definitely
-        # don't want base R behaviour where DF[NA,] returns an entire copy filled with NA everywhere.
-
-        else if (length(i)==nrow(x)) { irows=i=which(i) }
-        # The which() here auto removes NA for convenience so user doesn't need to remember "!is.na() & ..."
-        # Also this which() is for consistency of DT[colA>3,which=TRUE] and which(DT[,colA>3])
-        # Assigning to 'i' here as well to save memory, #926.
-
-        else stop("i evaluates to a logical vector length ", length(i), " but there are ", nrow(x), " rows. Recycling of logical i is no longer allowed as it hides more bugs than is worth the rare convenience. Explicitly use rep(...,length=.N) if you really need to recycle.")
-      } else {
-        irows = as.integer(i)  # e.g. DT[c(1,3)] and DT[c(-1,-3)] ok but not DT[c(1,-3)] (caught as error)
-        irows = .Call(CconvertNegAndZeroIdx, irows, nrow(x), is.null(jsub) || root!=":=")  # last argument is allowOverMax (NA when selecting, error when assigning)
-        # simplifies logic from here on: can assume positive subscripts (no zeros)
-        # maintains Arun's fix for #2697 (test 1042)
-        # efficient in C with more detailed helpful messages when user mixes positives and negatives
-        # falls through quickly (no R level allocs) if all items are within range [1,max] with no zeros or negatives
-        # minor TO DO: can we merge this with check_idx in fcast.c/subset ?
-      }
+      notjoin = FALSE
     }
+    else if (is.numeric(i)) {
+      if (!missing(on)) 
+        stop("logical error. i is not a data.table, but 'on' argument is provided.")
+      if (is.matrix(i) && ncol(i) != 1L) #826 - subset DT on single integer vector stored as matrix
+        stop("i is invalid type (matrix). Perhaps in future a 2 column matrix could return a list of elements of DT (in the spirit of A[B] in FAQ 2.14). Please report to data.table issue tracker if you'd like this, or add your comments to FR #657.")
+      irows = as.integer(i)  # e.g. DT[c(1,3)] and DT[c(-1,-3)] ok but not DT[c(1,-3)] (caught as error)
+      irows = .Call(CconvertNegAndZeroIdx, irows, nrow(x), is.null(jsub) || root!=":=")  # last argument is allowOverMax (NA when selecting, error when assigning)
+      # simplifies logic from here on: can assume positive subscripts (no zeros)
+      # maintains Arun's fix for #2697 (test 1042)
+      # efficient in C with more detailed helpful messages when user mixes positives and negatives
+      # falls through quickly (no R level allocs) if all items are within range [1,max] with no zeros or negatives
+      # minor TO DO: can we merge this with check_idx in fcast.c/subset ?
+      } 
+    else if ((is_char <- is.character(i)) || is.list(i)) {
+        if (is_char) {
+          isnull_inames = TRUE
+          i = data.table(V1=i)   # for user convenience; e.g. DT["foo"] without needing DT[.("foo")]
+        } else if (!is.data.table(i)) {
+          if (identical(class(i),"list") && length(i)==1L && is.data.frame(i[[1L]])) { i = as.data.table(i[[1L]]) }
+          else if (identical(class(i),"data.frame")) { i = as.data.table(i) }   # TO DO: avoid these as.data.table() and use a flag instead
+          else if (identical(class(i),"list")) {
+            isnull_inames = is.null(names(i))
+            i = as.data.table(i)
+          } else stop("i has evaluated to type list. Expecting logical, integer or double.")
+        }
+        if (missing(on)) {
+          if (!haskey(x)) {
+            stop("When i is a data.table (or character vector), the columns to join by must be specified using 'on=' argument (see ?data.table), by keying x (i.e. sorted, and, marked as sorted, see ?setkey), or by sharing column names between x and i (i.e., a natural join). Keyed joins might have further speed benefits on very large data due to x being sorted in RAM.")
+          }
+        } else if (identical(substitute(on), as.name(".NATURAL"))) {
+          naturaljoin = TRUE
+        }
+        if (naturaljoin) { # natural join #629
+          common_names = intersect(names_x, names(i))
+          len_common_names = length(common_names)
+          if (!len_common_names) stop("Attempting to do natural join but no common columns in provided tables")
+          if (verbose) {
+            which_cols_msg = if (len_common_names == length(x)) " all 'x' columns"
+            else paste(":", brackify(common_names))
+            cat("Joining but 'x' has no key, natural join using", which_cols_msg, "\n", sep = "")
+          }
+          on = common_names
+        }
+        if (!missing(on)) {
+          # on = .() is now possible, #1257
+          on_ops = .parse_on(substitute(on), isnull_inames)
+          on = on_ops[[1L]]
+          ops = on_ops[[2L]]
+          if (any(ops > 1L)) { ## fix for #4489;  ops = c("==", "<=", "<", ">=", ">", "!=")
+            allow.cartesian = TRUE
+          }
+          # TODO: collect all '==' ops first to speeden up Cnestedid
+          rightcols = colnamesInt(x, names(on), check_dups=FALSE)
+          leftcols  = colnamesInt(i, unname(on), check_dups=FALSE)
+        } else {
+          ## missing on
+          rightcols = chmatch(key(x), names_x)   # NAs here (i.e. invalid data.table) checked in bmerge()
+          leftcols = if (haskey(i))
+            chmatch(head(key(i), length(rightcols)), names(i))
+          else
+            seq_len(min(length(i),length(rightcols)))
+          rightcols = head(rightcols,length(leftcols))
+          ops = rep(1L, length(leftcols))
+        }
+        # Implementation for not-join along with by=.EACHI, #604
+        if (notjoin && (byjoin || mult != "all")) { # mult != "all" needed for #1571
+          notjoin = FALSE
+          if (verbose) {last.started.at=proc.time();cat("not-join called with 'by=.EACHI'; Replacing !i with i=setdiff_(x,i) ...");flush.console()}
+          orignames = copy(names(i))
+          i = setdiff_(x, i, rightcols, leftcols) # part of #547
+          if (verbose) {cat("done in",timetaken(last.started.at),"\n"); flush.console()}
+          setnames(i, orignames[leftcols])
+          setattr(i, 'sorted', names(i)) # since 'x' has key set, this'll always be sorted
+        }
+        i = .shallow(i, retain.key = TRUE)
+        ans = bmerge(i, x, leftcols, rightcols, roll, rollends, nomatch, mult, ops, verbose=verbose)
+        xo = ans$xo ## to make it available for further use.
+        # temp fix for issue spotted by Jan, test #1653.1. TODO: avoid this
+        # 'setorder', as there's another 'setorder' in generating 'irows' below...
+        if (length(ans$indices)) setorder(setDT(ans[1L:3L]), indices)
+        allLen1 = ans$allLen1
+        f__ = ans$starts
+        len__ = ans$lens
+        allGrp1 = FALSE # was previously 'ans$allGrp1'. Fixing #1991. TODO: Revisit about allGrp1 possibility for speedups in certain cases when I find some time.
+        indices__ = if (length(ans$indices)) ans$indices else seq_along(f__) # also for #1991 fix
+        # length of input nomatch (single 0 or NA) is 1 in both cases.
+        # When no match, len__ is 0 for nomatch=0 and 1 for nomatch=NA, so len__ isn't .N
+        # If using secondary key of x, f__ will refer to xo
+        if (is.na(which)) {
+          w = if (notjoin) f__!=0L else is.na(f__)
+          return( if (length(xo)) fsort(xo[w], internal=TRUE) else which(w) )
+        }
+        if (mult=="all") {
+          # is by=.EACHI along with non-equi join?
+          nqbyjoin = byjoin && length(ans$indices) && !allGrp1
+          if (!byjoin || nqbyjoin) {
+            # Really, `anyDuplicated` in base is AWESOME!
+            # allow.cartesian shouldn't error if a) not-join, b) 'i' has no duplicates
+            if (verbose) {last.started.at=proc.time();cat("Constructing irows for '!byjoin || nqbyjoin' ... ");flush.console()}
+            irows = if (allLen1) f__ else vecseq(f__,len__,
+              if (allow.cartesian ||
+                  notjoin || # #698. When notjoin=TRUE, ignore allow.cartesian. Rows in answer will never be > nrow(x).
+                  !anyDuplicated(f__, incomparables = c(0L, NA_integer_))) {
+                NULL # #742. If 'i' has no duplicates, ignore
+              } else as.double(nrow(x)+nrow(i))) # rows in i might not match to x so old max(nrow(x),nrow(i)) wasn't enough. But this limit now only applies when there are duplicates present so the reason now for nrow(x)+nrow(i) is just to nail it down and be bigger than max(nrow(x),nrow(i)).
+            if (verbose) {cat(timetaken(last.started.at),"\n"); flush.console()}
+            # Fix for #1092 and #1074
+            # TODO: implement better version of "any"/"all"/"which" to avoid
+            # unnecessary construction of logical vectors
+            if (identical(nomatch, 0L) && allLen1) irows = irows[irows != 0L]
+          } else {
+            if (length(xo) && missing(on))
+              stop("Internal error. Cannot by=.EACHI when joining to a secondary key, yet") # nocov
+            # since f__ refers to xo later in grouping, so xo needs to be passed through to dogroups too.
+            if (length(irows))
+              stop("Internal error. irows has length in by=.EACHI") # nocov
+          }
+          if (nqbyjoin) {
+            irows = if (length(xo)) xo[irows] else irows
+            xo = setorder(setDT(list(indices=rep.int(indices__, len__), irows=irows)))[["irows"]]
+            ans = .Call(CnqRecreateIndices, xo, len__, indices__, max(indices__), nomatch) # issue#4388 fix
+            f__ = ans[[1L]]; len__ = ans[[2L]]
+            allLen1 = FALSE # TODO; should this always be FALSE?
+            irows = NULL # important to reset
+            if (any_na(as_list(xo))) xo = xo[!is.na(xo)]
+          }
+        } else {
+          if (!byjoin) { #1287 and #1271
+            irows = f__ # len__ is set to 1 as well, no need for 'pmin' logic
+            if (identical(nomatch,0L)) irows = irows[len__>0L]  # 0s are len 0, so this removes -1 irows
+          }
+          # TODO: when nomatch=NA, len__ need not be allocated / set at all for mult="first"/"last"?
+          # TODO: how about when nomatch=0L, can we avoid allocating then as well?
+        }
+        if (length(xo) && length(irows)) {
+          irows = xo[irows]   # TO DO: fsort here?
+          if (mult=="all" && !allGrp1) { # following #1991 fix, !allGrp1 will always be TRUE. TODO: revisit.
+            if (verbose) {last.started.at=proc.time();cat("Reorder irows for 'mult==\"all\" && !allGrp1' ... ");flush.console()}
+            irows = setorder(setDT(list(indices=rep.int(indices__, len__), irows=irows)))[["irows"]]
+            if (verbose) {cat(timetaken(last.started.at),"\n"); flush.console()}
+          }
+        }
+        if (optimizedSubset){
+          ## special treatment for calls like DT[x == 3] that are transformed into DT[J(x=3), on = "x==x"]
+  
+          if(!.Call(CisOrderedSubset, irows, nrow(x))){
+            ## restore original order. This is a very expensive operation.
+            ## benchmarks have shown that starting with 1e6 irows, a tweak can significantly reduce time
+            ## (see #2366)
+            if (verbose) {last.started.at=proc.time()[3L];cat("Reordering", length(irows), "rows after bmerge done in ... ");flush.console()}
+            if(length(irows) < 1e6){
+              irows = fsort(irows, internal=TRUE) ## internally, fsort on integer falls back to forderv
+              } else {
+                irows = as.integer(fsort(as.numeric(irows))) ## nocov; parallelized for numeric, but overhead of type conversion
+              }
+            if (verbose) {cat(round(proc.time()[3L]-last.started.at,3L),"secs\n");flush.console()}
+          }
+          ## make sure, all columns are taken from x and not from i.
+          ## This is done by simply telling data.table to continue as if there was a simple subset
+          leftcols  = integer(0L)
+          rightcols = integer(0L)
+          i = irows ## important to make i not a data.table because otherwise Gforce doesn't kick in
+        }
+    } else stop("i has evaluated to type ", typeof(i), ". Expecting logical, integer or double.")
+    
     if (notjoin) {
       if (byjoin || !is.integer(irows) || is.na(nomatch)) stop("Internal error: notjoin but byjoin or !integer or nomatch==NA") # nocov
       irows = irows[irows!=0L]
